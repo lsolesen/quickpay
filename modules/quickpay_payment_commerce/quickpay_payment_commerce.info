@@ -1,0 +1,6 @@
+name = Commerce QuickPay Payment
+description = Process Commerce payments using QuickPay.
+package = quickpay-payment
+dependencies[] = quickpay_payment
+dependencies[] = commerce_payment
+core = 7.x

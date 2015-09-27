@@ -1,0 +1,62 @@
+/* Shared */
+#quickpay_payment {
+  position: relative;
+  background: #f9f9f9;
+  border: 1px solid #e0e0e0;
+  border-radius: 5px;
+  padding: 20px;
+}
+
+#quickpay_payment.loading::after {
+  position: absolute;
+  top: 0px;
+  left: 0px;
+  border-radius: 5px;
+  background: rgba(255,255,255,.5) url('images/rolling.svg') center center no-repeat;
+  background-size: 50px;
+  content: "";
+  height: 100%;
+  width: 100%;
+}
+#quickpay_payment__test {
+  display: none;
+  color: red;
+  font-weight: bold;
+}
+
+.quickpay_payment_buttons {
+  display: none;
+}
+
+.quickpay-card-icon {
+  position: relative;
+  top: 5px;
+  border-radius: 3px;
+  margin: 0 5px 0 0;
+  max-height: 20px;
+}
+
+#edit-parameter-payment-method-settings-payment-method-settings-paymentmethods {
+  max-width: 800px;
+}
+
+#edit-parameter-payment-method-settings-payment-method-settings-paymentmethods::after {
+  display: table;
+  content: "";
+  clear: both;
+}
+
+
+#edit-parameter-payment-method-settings-payment-method-settings-paymentmethods input[type="checkbox"] {
+  display: inline-block;
+  margin-right: 5px;
+}
+
+@media (min-width: 768px) {
+  #edit-parameter-payment-method-settings-payment-method-settings-paymentmethods > div {
+    float: left;
+    width: 50%;
+    box-sizing: border-box;
+    padding: 5px 15px;
+  }
+}

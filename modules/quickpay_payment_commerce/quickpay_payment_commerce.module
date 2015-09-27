@@ -1,0 +1,480 @@
+<?php
+/**
+ * @file
+ * Integrates quickpay.dk redirected payment service - for Commerce package.
+ */
+
+use QuickPay\QuickPay as QuickPay;
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function quickpay_payment_commerce_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['quickpay_payment_commerce'] = array(
+    'base' => 'quickpay_payment_commerce',
+    'title' => t('QuickPay Payment Gateway'),
+    'short_title' => t('QuickPay'),
+    'description' => t('QuickPay Payment Gateway'),
+    'terminal' => FALSE,
+    'active' => TRUE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+
+/**
+ * Creates a callback endpoint used for processing QuickPay responses.
+ *
+ * @return array
+ *         the endpoint data.
+ */
+function quickpay_payment_commerce_menu() {
+  $items = array();
+  $items['commerce-quickpay-payment/callback'] = array(
+    'page callback' => 'quickpay_payment_commerce_callback',
+    'page arguments' => array(),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+
+/**
+ * Handles callback requests.
+ *
+ * @return bool
+ *         returns FALSE if the callback is not accepted.
+ */
+function quickpay_payment_commerce_callback() {
+  // Check for the QuickPay checksum.
+  if (!isset($_SERVER["HTTP_QUICKPAY_CHECKSUM_SHA256"])) {
+    return FALSE;
+  }
+
+  // Fetch the callback response body.
+  $response_body = file_get_contents("php://input");
+
+  // Callback data as JSON.
+  $json = json_decode($response_body);
+
+  // Load order object.
+  $order = commerce_order_load((int) $json->order_id);
+
+  // Load payment method object.
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+
+  // Store payment method settings in its own variable for easy reference.
+  $settings = $payment_method['settings'];
+
+  // Hashed response.
+  $hash = hash_hmac('sha256', $response_body, $settings['agreementPrivateKey']);
+
+  // Callback checksum control.
+  if ($hash != $_SERVER["HTTP_QUICKPAY_CHECKSUM_SHA256"]) {
+    return FALSE;
+  }
+
+  // Get latest transaction operation.
+  $operation = end($json->operations);
+
+  // Create transaction.
+  $transaction = commerce_payment_transaction_new($payment_method['method_id'], $json->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $json->id;
+  $transaction->message = sprintf('%s - %s', ucfirst($operation->type), $operation->qp_status_msg);
+  $transaction->amount = commerce_currency_decimal_to_amount(QuickpayPaymentHelper::priceNormalize($operation->amount), $json->currency);
+  $transaction->currency_code = $json->currency;
+  $transaction->payload[REQUEST_TIME] = $response_body;
+
+  // If this is a test transaction, append the transaction ID with a warning.
+  if ($json->test_mode === TRUE) {
+    $transaction->remote_id .= ' - ' . t('TEST TRANSACTION');
+  }
+
+  // The transaction was accepted.
+  if ($json->accepted) {
+    // Default status to pending.
+    // It might be changed later in the progress.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+
+    switch ($operation->type) {
+      case 'authorize':
+        quickpay_payment_commerce_order__authorize($order, $transaction);
+        break;
+
+      case 'cancel':
+        quickpay_payment_commerce_order__cancel($order);
+        break;
+
+      case 'capture':
+        quickpay_payment_commerce_order__capture($order);
+        break;
+
+      case 'refund':
+        break;
+
+      case 'recurring':
+        break;
+
+    }
+  }
+  else {
+    // Save the transaction.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    commerce_payment_transaction_save($transaction);
+  }
+}
+
+
+/**
+ * Returns the settings form shown in the admin section.
+ *
+ * @param object $settings
+ *         Settings array.
+ *
+ * @return array
+ *         return the settings array.
+ */
+function quickpay_payment_commerce_settings_form($settings) {
+  return QuickpayPaymentSettings::settingsForm($settings);
+}
+
+
+/**
+ * Prepares the payment links and redirects the customer to the payment window.
+ *
+ * @param object $form
+ *         The form.
+ * @param object &$form_state
+ *         The form state.
+ * @param object $order
+ *         The order.
+ * @param object $payment_method
+ *         The payment method.
+ *
+ * @return string
+ *         Might return an error message.
+ */
+function quickpay_payment_commerce_redirect_form($form, &$form_state, $order, $payment_method) {
+
+  try {
+    $settings = $payment_method['settings'];
+
+    // Create an API client instance.
+    $api = new QuickPay(":{$settings['apiApiKey']}");
+
+    // Get order wrapper.
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+    // Create payment.
+    $payment_response = $api->request->post('/payments', array(
+      'currency' => $order_wrapper->commerce_order_total->currency_code->value(),
+      'order_id' => QuickpayPaymentHelper::orderNumberStandardize($order->order_number),
+    ));
+
+    // If the payment was created, lets go create a payment link.
+    if ($payment_response->isSuccess()) {
+      // Create payment methods string.
+      $payment_methods_array = quickpay_payment_filter_payment_methods($settings['paymentMethods']);
+      $payment_methods = implode(',', $payment_methods_array);
+
+      // Get the payment data.
+      $payment = $payment_response->asObject();
+      $payment_link_response = $api->request->put("/payments/{$payment->id}/link", array(
+        'amount' => $order_wrapper->commerce_order_total->amount->value(),
+        'autocapture' => $settings['autocapture'],
+        'autofee' => $settings['autofee'],
+        'branding_id' => $settings['branding_id'],
+        'payment_methods' => $payment_methods,
+        'agreement_id' => $settings['agreement_id'],
+        'language' => $settings['language'],
+        'continueurl' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+        'cancelurl' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+        'callbackurl' => url('commerce-quickpay-payment/callback', array('absolute' => TRUE)),
+      ));
+
+      if ($payment_link_response->isSuccess()) {
+        $payment_link = $payment_link_response->asObject();
+        header(sprintf('location: %s', $payment_link->url));
+      }
+      else {
+        echo 'Payment link error: '; print_r($payment_link_response->asRaw());
+        exit;
+      }
+    }
+    else {
+      echo 'Payment error: '; print_r($payment_response->asRaw());
+      exit;
+    }
+  }
+  catch (Exception $e) {
+    echo $e->getMessage();
+  }
+
+  return array();
+}
+
+
+/**
+ * Inserts the API action view after inside the transaction entry.
+ *
+ * @param object &$view
+ *         The view.
+ * @param object &$output
+ *         The output.
+ * @param object &$cache
+ *         The cache.
+ */
+function quickpay_payment_commerce_views_post_render(&$view, &$output, &$cache) {
+  if ($view->name == 'commerce_payment_order') {
+    // Get all transactions from this module.
+    $transactions = array_filter($view->result, function($t) {
+      return 'quickpay_payment_commerce' == $t->commerce_payment_transaction_payment_method;
+    });
+
+    if (!empty($transactions)) {
+      // Get the very last transaction.
+      $transaction = end($transactions);
+
+      // Get remote transaction ID.
+      $transaction_id = (int) $transaction->commerce_payment_transaction_remote_id;
+
+      // Get order ID.
+      $order_id = $transaction->commerce_payment_transaction_order_id;
+
+      // Append the output with the QuickPay API box.
+      $output .= quickpay_payment_api_view($order_id, $transaction_id, basename(__FILE__, '.module'));
+
+      // Add clearfix class to the view-commerce-payment-order container.
+      // Fixes float problems.
+      $output = str_replace('view-commerce-payment-order', 'view-commerce-payment-order clearfix', $output);
+    }
+  }
+}
+
+
+/**
+ * Implements hook_quickpay_payment_ajax_handler().
+ *
+ * @throws Exception
+ *         Throws an error exception.
+ */
+function quickpay_payment_commerce_quickpay_payment_ajax_handler($action, $transaction_id, $order_id) {
+  // Load order object.
+  $order = commerce_order_load($order_id);
+
+  // Load payment method object.
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+
+  // Get API key from settings.
+  $api_key = $payment_method['settings']['apiApiKey'];
+
+  // Instantiate an API connection.
+  $api = new QuickPay(":{$api_key}");
+
+  // Instantiate order wrapper.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  switch ($action) {
+    /* CAPTURE */
+    case 'capture':
+      // Make API request.
+      $request = $api->request->post("/payments/{$transaction_id}/capture", array(
+        'amount' => $order_wrapper->commerce_order_total->amount->value(),
+      ));
+
+      // Was the request successful?
+      if ($request->isSuccess()) {
+        // Update revision log.
+        quickpay_payment_commerce_order__capture($order);
+
+        // Print JSON object.
+        echo QuickpayPaymentJSON::fromArray($request->asArray());
+        exit;
+      }
+      break;
+
+    /* CANCEL */
+    case 'cancel':
+      // Make API request.
+      $request = $api->request->post("/payments/{$transaction_id}/cancel");
+
+      // Was the request successful?
+      if ($request->isSuccess()) {
+        // Update revision log.
+        quickpay_payment_commerce_order__cancel($order);
+
+        // Print JSON object.
+        echo QuickpayPaymentJSON::fromArray($request->asArray());
+        exit;
+      }
+      break;
+
+    /* STATUS */
+    case 'status':
+      // Make API request.
+      $request = $api->request->get("/payments/{$transaction_id}");
+
+      // Was the request successful?
+      if ($request->isSuccess()) {
+        // Print JSON object.
+        echo QuickpayPaymentJSON::fromArray($request->asArray());
+        exit;
+      }
+      break;
+
+    /* REFUND */
+    case 'refund':
+      $request = $api->request->post("/payments/{$transaction_id}/refund", array(
+        'amount' => $order_wrapper->commerce_order_total->amount->value(),
+      ));
+
+      if ($request->isSuccess()) {
+        // Update revision log.
+        quickpay_payment_commerce_order__refund($order, $request->asObject());
+
+        // Print JSON object.
+        echo QuickpayPaymentJSON::fromArray($request->asArray());
+        exit;
+      }
+      break;
+  }
+  throw new Exception(sprintf("Unknown payment action: %s", $action));
+}
+
+
+/**
+ * Handles an order when a payment is captured.
+ *
+ * @param object $order
+ *         The order object.
+ */
+function quickpay_payment_commerce_order__capture($order) {
+  commerce_order_status_update($order, NULL, TRUE, FALSE, '');
+  commerce_order_status_update($order, 'processing', FALSE, TRUE, QuickpayPaymentHelper::revision('capture'));
+}
+
+
+/**
+ * Handles an order when a payment is canceled.
+ *
+ * @param object $order
+ *        The order object.
+ */
+function quickpay_payment_commerce_order__cancel($order) {
+  commerce_order_status_update($order, 'canceled', FALSE, TRUE, QuickpayPaymentHelper::revision('canceled'));
+}
+
+
+/**
+ * Handles an order when a payment is refunded.
+ *
+ * @param object $order
+ *        The order object.
+ */
+function quickpay_payment_commerce_order__refund($order, $api_transaction) {
+  $payment_method = 'quickpay_payment_commerce';
+
+  // Get last operation.
+  $operation = end($api_transaction->operations);
+
+  // Create a transaction entry in Commerce.
+  $transaction = commerce_payment_transaction_new($payment_method, $order->order_number);
+  $transaction->instance_id = $payment_method;
+  $transaction->remote_id = $api_transaction->id;
+  $transaction->message = sprintf('%s - %s', ucfirst($operation->type), $operation->qp_status_msg);
+  $transaction->amount = commerce_currency_decimal_to_amount(QuickpayPaymentHelper::priceNormalize($operation->amount) * -1, $api_transaction->currency);
+  $transaction->currency_code = $api_transaction->currency;
+  $transaction->payload[REQUEST_TIME] = json_encode($api_transaction);
+
+  // Append the transaction ID with a warning message on test trasactions.
+  if ($api_transaction->test_mode === TRUE) {
+    $transaction->remote_id .= ' - ' . t('TEST TRANSACTION');
+  }
+
+  // The transaction was accepted.
+  if ($api_transaction->accepted) {
+    // Default status to pending.
+    // It might be changed later in the progress.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+    commerce_order_status_update($order, 'completed', FALSE, TRUE, QuickpayPaymentHelper::revision('refund'));
+  }
+  else {
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+  }
+
+  commerce_payment_transaction_save($transaction);
+}
+
+
+/**
+ * Modifies the gateway name on checkout. Set custom icons and gateway name.
+ *
+ * @param object &$form
+ *         The form.
+ * @param object &$form_state
+ *         The form state.
+ */
+function quickpay_payment_commerce_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios.
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Find quickpay_payment_commerce option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id) = explode('|', $key);
+
+      // If we find Quickpay.
+      if ($method_id == 'quickpay_payment_commerce') {
+
+        // Reset name.
+        $value = '';
+
+        // Retrieve the settings.
+        $settings = $form['commerce_payment']['payment_methods']['#value'][$key]["settings"];
+
+        // Get selected cards.
+        $payment_methods = array_filter($settings['paymentMethods'], function($card) {
+          return $card !== 0;
+        });
+
+        // Prepare payments card array.
+        $all_cards = quickpay_payment_cards();
+
+        // Loop through all cards and see if they have been chosen.
+        foreach ($payment_methods as $payment_method) {
+          if (array_key_exists($payment_method, $all_cards)) {
+            $value .= sprintf('<img class="commerce-quickpay-method__icon" src="%s" title="%s" />', $all_cards[$payment_method]['image'], $all_cards[$payment_method]['name']);
+          }
+        }
+
+        // Add original payment name.
+        $value .= $settings['gatewayName'];
+
+        // Add CSS.
+        $form['commerce_payment']['payment_method']['#attached']['css'][] = drupal_get_path('module', 'quickpay_payment') . '/quickpay_payment.css';
+
+        break;
+      }
+    }
+  }
+}
+
+
+/**
+ * Handles an order when a payment is authorized.
+ *
+ * @param object $order
+ *         The order object.
+ * @param object $transaction
+ *         The transaction object.
+ */
+function quickpay_payment_commerce_order__authorize($order, $transaction) {
+  // Save the transaction.
+  commerce_payment_transaction_save($transaction);
+}
